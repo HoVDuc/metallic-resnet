@@ -1,0 +1,324 @@
+"""Train the truncated ResNet difference model on precomputed erased pairs."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import random
+from pathlib import Path
+from typing import List, Optional, Sequence, Tuple
+
+import cv2
+import numpy as np
+import torch
+from torch import nn
+from torch.nn import functional as F
+from tqdm import tqdm
+
+from detail_removal import (
+    PrecomputedPairDataLoader,
+    PrecomputedPairDataset,
+    SynchronizedPhotometricAugment,
+)
+from losses import MultiLayerDiffLoss, PosWeightScheduler, estimate_alpha_max
+from models import (
+    DifferenceModel,
+    TruncatedResNet101,
+    build_targets,
+    prepare_pair_batch,
+    tap_sizes,
+)
+from torchvision.models import ResNet101_Weights
+
+
+class IndexDataset:
+    """A lightweight index view preserving the dataset's NumPy sample contract."""
+
+    def __init__(self, dataset: PrecomputedPairDataset, indices: Sequence[int]) -> None:
+        self.dataset = dataset
+        self.indices = list(indices)
+
+    def __len__(self) -> int:
+        return len(self.indices)
+
+    def __getitem__(self, index: int):
+        return self.dataset[self.indices[index]]
+
+
+def split_indices(size: int, validation_fraction: float, seed: int) -> Tuple[List[int], List[int]]:
+    if size < 2:
+        raise ValueError("at least two pairs are required for train/validation split")
+    if not 0.0 < validation_fraction < 1.0:
+        raise ValueError("validation_fraction must be in (0, 1)")
+    indices = list(range(size))
+    random.Random(seed).shuffle(indices)
+    validation_size = max(1, int(round(size * validation_fraction)))
+    validation_size = min(validation_size, size - 1)
+    return indices[validation_size:], indices[:validation_size]
+
+
+def _positive_fractions(dataset: PrecomputedPairDataset, indices: Sequence[int]) -> List[float]:
+    fractions = []
+    for index in indices:
+        _, _, mask = dataset[index]
+        fractions.append(float(mask.mean()))
+    return fractions
+
+
+def _trainable_parameters(model: DifferenceModel, head_lr: float, backbone_lr: float):
+    backbone = [parameter for parameter in model.backbone.parameters() if parameter.requires_grad]
+    heads = [
+        parameter
+        for name, parameter in model.named_parameters()
+        if not name.startswith("backbone.") and parameter.requires_grad
+    ]
+    groups = []
+    if heads:
+        groups.append({"params": heads, "lr": head_lr})
+    if backbone:
+        groups.append({"params": backbone, "lr": backbone_lr})
+    if not groups:
+        raise ValueError("model has no trainable parameters")
+    return groups
+
+
+def _autocast_context(device: torch.device):
+    enabled = device.type == "cuda" and torch.cuda.is_bf16_supported()
+    return torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=enabled)
+
+
+def _denormalize(view: torch.Tensor) -> np.ndarray:
+    mean = torch.tensor((0.485, 0.456, 0.406), device=view.device)[:, None, None]
+    std = torch.tensor((0.229, 0.224, 0.225), device=view.device)[:, None, None]
+    rgb = (view * std + mean).clamp(0, 1).detach().cpu().permute(1, 2, 0).numpy()
+    return np.ascontiguousarray((rgb[:, :, ::-1] * 255).round().astype(np.uint8))
+
+
+def dump_heatmaps(
+    output_dir: Path,
+    view_a: torch.Tensor,
+    mask_batch: torch.Tensor,
+    outputs: dict[str, dict[str, torch.Tensor]],
+) -> None:
+    """Save a single original / target / prediction diagnostic image."""
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    head_name = "learned" if "learned" in outputs else next(iter(outputs))
+    tap_name = "f2" if "f2" in outputs[head_name] else next(iter(outputs[head_name]))
+    prediction = outputs[head_name][tap_name][0:1].unsqueeze(1)
+    heatmap = F.interpolate(
+        prediction, size=mask_batch.shape[-2:], mode="bilinear", align_corners=False
+    )[0, 0].detach().float().cpu().numpy()
+    heatmap = cv2.applyColorMap(
+        np.clip(heatmap * 255.0, 0, 255).astype(np.uint8), cv2.COLORMAP_TURBO
+    )
+    target = (mask_batch[0].detach().cpu().numpy() > 0).astype(np.uint8) * 255
+    target = cv2.cvtColor(target, cv2.COLOR_GRAY2BGR)
+    panel = np.hstack((_denormalize(view_a[0]), target, heatmap))
+    if not cv2.imwrite(str(output_dir / "latest.jpg"), panel):
+        raise OSError("Could not write heatmap diagnostic")
+
+
+def _run_epoch(
+    loader: PrecomputedPairDataLoader,
+    *,
+    model: DifferenceModel,
+    criterion: MultiLayerDiffLoss,
+    optimizer: Optional[torch.optim.Optimizer],
+    scheduler: PosWeightScheduler,
+    crop_size: int,
+    rng: random.Random,
+    device: torch.device,
+    max_grad_norm: float,
+    heatmap_dir: Optional[Path] = None,
+) -> Tuple[float, dict[str, float]]:
+    training = optimizer is not None
+    model.train(training)
+    total_loss = 0.0
+    total_pairs = 0
+    component_totals: dict[str, float] = {}
+    context = torch.enable_grad() if training else torch.no_grad()
+    with context:
+        for originals, erased, masks in loader:
+            view_a, view_b, mask_batch = prepare_pair_batch(
+                originals,
+                erased,
+                masks,
+                crop_size=crop_size,
+                rng=rng,
+                device=device,
+            )
+            if training:
+                assert optimizer is not None
+                optimizer.zero_grad(set_to_none=True)
+            with _autocast_context(device):
+                outputs = model(view_a, view_b)
+                targets = build_targets(mask_batch, tap_sizes(outputs))
+                loss, components = criterion(outputs, targets, alpha=scheduler.alpha)
+            if training:
+                loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                optimizer.step()
+                scheduler.step(view_a.shape[0])
+            if heatmap_dir is not None:
+                dump_heatmaps(heatmap_dir, view_a, mask_batch, outputs)
+                heatmap_dir = None
+            batch_size = view_a.shape[0]
+            total_loss += float(loss.detach()) * batch_size
+            total_pairs += batch_size
+            for name, value in components.items():
+                component_totals[name] = component_totals.get(name, 0.0) + float(value) * batch_size
+    if not total_pairs:
+        raise ValueError("loader did not yield any batches")
+    return (
+        total_loss / total_pairs,
+        {name: value / total_pairs for name, value in component_totals.items()},
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Train the detail-removal difference model.")
+    parser.add_argument("--root", required=True, type=Path)
+    parser.add_argument("--out", type=Path, default=Path("outputs/training"))
+    parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--crop", type=int, default=512)
+    parser.add_argument("--batch", type=int, default=4)
+    parser.add_argument("--output-stride", type=int, choices=(4, 8), default=8)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--validation-fraction", type=float, default=0.15)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--max-grad-norm", type=float, default=1.0)
+    parser.add_argument("--weights-path", type=Path)
+    parser.add_argument("--no-pretrained", action="store_true")
+    parser.add_argument("--device", default=None)
+    parser.add_argument("--resume", type=Path)
+    parser.add_argument("--disable-augment", action="store_true")
+    return parser
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = build_parser().parse_args(argv)
+    if args.epochs <= 0 or args.crop <= 0 or args.batch <= 0:
+        raise ValueError("epochs, crop, and batch must be positive")
+    torch.manual_seed(args.seed)
+    random.seed(args.seed)
+    device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    augment = None
+    if not args.disable_augment:
+        augment = SynchronizedPhotometricAugment(seed=args.seed)
+    full_train_dataset = PrecomputedPairDataset(args.root, paired_transform=augment)
+    raw_dataset = PrecomputedPairDataset(args.root)
+    train_indices, validation_indices = split_indices(
+        len(raw_dataset), args.validation_fraction, args.seed
+    )
+    train_dataset = IndexDataset(full_train_dataset, train_indices)
+    validation_dataset = IndexDataset(raw_dataset, validation_indices)
+    train_loader = PrecomputedPairDataLoader(
+        train_dataset, batch_size=args.batch, shuffle=True, drop_last=True, seed=args.seed
+    )
+    validation_loader = PrecomputedPairDataLoader(
+        validation_dataset, batch_size=args.batch, shuffle=False, drop_last=False
+    )
+
+    weights = None if args.no_pretrained or args.weights_path else ResNet101_Weights.IMAGENET1K_V2
+    backbone = TruncatedResNet101(
+        weights=weights,
+        weights_path=args.weights_path,
+        output_stride=args.output_stride,
+        trainable_stages=("layer2",),
+    )
+    model = DifferenceModel(backbone, learned=True, cosine=True).to(device)
+    criterion = MultiLayerDiffLoss(
+        tap_weights={"f0": 0.5, "f1": 1.0, "f2": 1.0},
+        head_weights={"learned": 1.0, "cosine": 0.2},
+    ).to(device)
+    optimizer = torch.optim.AdamW(
+        _trainable_parameters(model, args.lr, args.lr / 10.0), weight_decay=args.weight_decay
+    )
+    alpha_max = estimate_alpha_max(_positive_fractions(raw_dataset, train_indices))
+    hold_pairs = max(args.batch, len(train_dataset) * 2)
+    ramp_pairs = max(args.batch, len(train_dataset) * 6)
+    scheduler = PosWeightScheduler("linear", alpha_max, hold_pairs, ramp_pairs)
+    start_epoch = 0
+    if args.resume is not None:
+        checkpoint = torch.load(str(args.resume), map_location=device)
+        model.load_state_dict(checkpoint["model"])
+        optimizer.load_state_dict(checkpoint["optimizer"])
+        criterion.load_state_dict(checkpoint["criterion"])
+        scheduler.load_state_dict(checkpoint["scheduler"])
+        start_epoch = int(checkpoint["epoch"]) + 1
+
+    args.out.mkdir(parents=True, exist_ok=True)
+    heatmap_dir = args.out / "heatmaps"
+    log_path = args.out / "metrics.jsonl"
+    split = {
+        "train_sample_ids": [raw_dataset.metadata(index)["sample_id"] for index in train_indices],
+        "validation_sample_ids": [raw_dataset.metadata(index)["sample_id"] for index in validation_indices],
+    }
+    with (args.out / "split.json").open("w", encoding="utf-8") as stream:
+        json.dump(split, stream, indent=2)
+
+    with log_path.open("a", encoding="utf-8") as log_stream:
+        for epoch in range(start_epoch, args.epochs):
+            train_loss, train_components = _run_epoch(
+                train_loader,
+                model=model,
+                criterion=criterion,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                crop_size=args.crop,
+                rng=random.Random(args.seed + epoch),
+                device=device,
+                max_grad_norm=args.max_grad_norm,
+                heatmap_dir=heatmap_dir,
+            )
+            validation_loss, validation_components = _run_epoch(
+                validation_loader,
+                model=model,
+                criterion=criterion,
+                optimizer=None,
+                scheduler=scheduler,
+                crop_size=args.crop,
+                rng=random.Random(args.seed + 10_000 + epoch),
+                device=device,
+                max_grad_norm=args.max_grad_norm,
+            )
+            scheduler.on_validation(validation_loss)
+            mitigated = criterion.mitigate_exploding_taps(
+                validation_components,
+                ratio=3.0,
+                min_loss=1e-3,
+                decay=0.5,
+                min_weight=0.05,
+            )
+            metrics = {
+                "epoch": epoch,
+                "train_loss": train_loss,
+                "validation_loss": validation_loss,
+                "alpha": scheduler.alpha,
+                "alpha_phase": scheduler.phase,
+                "alpha_max": alpha_max,
+                "pixel_subtraction_reference": 1.0,
+                "train_components": train_components,
+                "validation_components": validation_components,
+                "mitigated_taps": mitigated,
+            }
+            log_stream.write(json.dumps(metrics) + "\n")
+            log_stream.flush()
+            checkpoint = {
+                "epoch": epoch,
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "criterion": criterion.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "split": split,
+                "args": vars(args),
+            }
+            torch.save(checkpoint, args.out / "latest.pt")
+            print(json.dumps(metrics))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

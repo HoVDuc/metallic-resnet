@@ -74,9 +74,8 @@ class SymConvHead(nn.Module):
         symmetric = torch.cat(
             (
                 (feature_a - feature_b).abs(),
-                feature_a + feature_b,
-                feature_a * feature_b,
+                feature_a, feature_b,
             ),
             dim=1,
         )
-        return torch.sigmoid(self.output(self.blocks(symmetric)))
+        return torch.sigmoid(self.output(self.blocks(symmetric))).squeeze(1)

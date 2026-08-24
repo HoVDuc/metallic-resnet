@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from pathlib import Path
+from typing import Mapping, Optional, Sequence
 
 import torch
 from torch import nn
@@ -49,6 +51,8 @@ class TruncatedResNet101(nn.Module):
         output_stride: int = 8,
         *,
         progress: bool = True,
+        weights_path: Optional[Path] = None,
+        trainable_stages: Sequence[str] = ("layer2",),
     ) -> None:
         super().__init__()
         if output_stride not in (4, 8):
@@ -85,14 +89,46 @@ class TruncatedResNet101(nn.Module):
             if isinstance(module, nn.Conv2d):
                 nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
 
-        verified_weights = ResNet101_Weights.verify(weights)
-        if verified_weights is not None:
-            pretrained = verified_weights.get_state_dict(
-                progress=progress,
-                check_hash=True,
-            )
-            own_keys = self.state_dict().keys()
-            self.load_state_dict({key: pretrained[key] for key in own_keys})
+        self._load_pretrained_weights(weights, weights_path, progress)
+        self._set_trainable_stages(trainable_stages)
+
+    def _load_pretrained_weights(
+        self,
+        weights: ResNet101_Weights | None,
+        weights_path: Optional[Path],
+        progress: bool,
+    ) -> None:
+        if weights_path is not None:
+            loaded = torch.load(str(weights_path), map_location="cpu")
+            if isinstance(loaded, Mapping) and "state_dict" in loaded:
+                loaded = loaded["state_dict"]
+            if not isinstance(loaded, Mapping):
+                raise ValueError("weights_path must contain a state-dict mapping")
+            pretrained = {
+                (str(key)[7:] if str(key).startswith("module.") else str(key)): value
+                for key, value in loaded.items()
+            }
+        else:
+            verified_weights = ResNet101_Weights.verify(weights)
+            if verified_weights is None:
+                return
+            pretrained = verified_weights.get_state_dict(progress=progress, check_hash=True)
+        own_keys = self.state_dict().keys()
+        missing = [key for key in own_keys if key not in pretrained]
+        if missing:
+            raise ValueError("pretrained weights are missing keys: {}".format(missing[:3]))
+        self.load_state_dict({key: pretrained[key] for key in own_keys})
+
+    def _set_trainable_stages(self, trainable_stages: Sequence[str]) -> None:
+        allowed = ("conv1", "bn1", "layer1", "layer2")
+        requested = tuple(str(stage) for stage in trainable_stages)
+        unknown = sorted(set(requested).difference(allowed))
+        if unknown:
+            raise ValueError("unknown trainable stages: {}".format(unknown))
+        self.trainable_stages = requested
+        trainable = set(requested)
+        for stage_name in allowed:
+            getattr(self, stage_name).requires_grad_(stage_name in trainable)
 
     def _make_layer(
         self,

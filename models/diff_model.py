@@ -17,8 +17,31 @@ def _tap_channels(backbone: nn.Module) -> dict[str, int]:
     if isinstance(channels, Sequence):
         values = [int(value) for value in channels]
         if len(values) == 3:
-            return dict(zip(("f0", "f1", "f2"), values, strict=True))
+            return dict(zip(("f0", "f1", "f2"), values))
     raise ValueError("a learned DifferenceModel backbone must declare tap_channels")
+
+
+def tap_sizes(
+    outputs: Mapping[str, Mapping[str, torch.Tensor]],
+) -> dict[str, tuple[int, int]]:
+    """Return spatial sizes for every tap, validated across enabled heads."""
+
+    sizes: dict[str, tuple[int, int]] = {}
+    for head_name, head_outputs in outputs.items():
+        for tap_name, prediction in head_outputs.items():
+            if prediction.ndim < 3:
+                raise ValueError(
+                    f"prediction for {head_name}/{tap_name} must have spatial dimensions"
+                )
+            size = (int(prediction.shape[-2]), int(prediction.shape[-1]))
+            previous = sizes.setdefault(tap_name, size)
+            if previous != size:
+                raise ValueError(
+                    f"tap {tap_name!r} has inconsistent sizes {previous} and {size}"
+                )
+    if not sizes:
+        raise ValueError("model outputs must contain at least one tap")
+    return sizes
 
 
 class DifferenceModel(nn.Module):
