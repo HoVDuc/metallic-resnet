@@ -76,12 +76,12 @@ def prepare_pair_batch(
     erased: Sequence[np.ndarray],
     masks: Sequence[np.ndarray],
     *,
-    crop_size: int,
-    rng: Any,
+    crop_size: Optional[int] = None,
+    rng: Any = None,
     device: Optional[torch.device] = None,
     biased_probability: float = 0.7,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Crop, normalize, and stack variable-size NumPy pairs for model input."""
+    """Normalize and stack pairs, optionally applying a shared random crop."""
 
     if not (len(originals) == len(erased) == len(masks)):
         raise ValueError("originals, erased, and masks must have equal lengths")
@@ -93,10 +93,17 @@ def prepare_pair_batch(
     for original, erased_image, mask in zip(originals, erased, masks):
         if original.shape != erased_image.shape or original.shape[:2] != mask.shape:
             raise ValueError("each original, erased, mask triplet must share spatial shape")
-        x, y = sample_crop_box(mask, crop_size, rng, biased_probability)
-        original_crop = _crop_and_pad(original, x, y, crop_size, is_mask=False)
-        erased_crop = _crop_and_pad(erased_image, x, y, crop_size, is_mask=False)
-        mask_crop = _crop_and_pad(mask, x, y, crop_size, is_mask=True)
+        if crop_size is None:
+            original_crop = original
+            erased_crop = erased_image
+            mask_crop = mask
+        else:
+            if rng is None:
+                raise ValueError("rng is required when crop_size is set")
+            x, y = sample_crop_box(mask, crop_size, rng, biased_probability)
+            original_crop = _crop_and_pad(original, x, y, crop_size, is_mask=False)
+            erased_crop = _crop_and_pad(erased_image, x, y, crop_size, is_mask=False)
+            mask_crop = _crop_and_pad(mask, x, y, crop_size, is_mask=True)
         views_a.append(_normalize_bgr(original_crop))
         views_b.append(_normalize_bgr(erased_crop))
         cropped_masks.append(torch.from_numpy((mask_crop > 0).astype(np.float32)))

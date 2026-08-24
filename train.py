@@ -126,11 +126,10 @@ def _run_epoch(
     criterion: MultiLayerDiffLoss,
     optimizer: Optional[torch.optim.Optimizer],
     scheduler: PosWeightScheduler,
-    crop_size: int,
-    rng: random.Random,
     device: torch.device,
     max_grad_norm: float,
     heatmap_dir: Optional[Path] = None,
+    max_batches: Optional[int] = None,
 ) -> Tuple[float, dict[str, float]]:
     training = optimizer is not None
     model.train(training)
@@ -139,35 +138,40 @@ def _run_epoch(
     component_totals: dict[str, float] = {}
     context = torch.enable_grad() if training else torch.no_grad()
     with context:
-        for originals, erased, masks in loader:
-            view_a, view_b, mask_batch = prepare_pair_batch(
-                originals,
-                erased,
-                masks,
-                crop_size=crop_size,
-                rng=rng,
-                device=device,
-            )
+        for batch_index, (originals, erased, masks) in enumerate(loader):
             if training:
                 assert optimizer is not None
                 optimizer.zero_grad(set_to_none=True)
-            with _autocast_context(device):
-                outputs = model(view_a, view_b)
-                targets = build_targets(mask_batch, tap_sizes(outputs))
-                loss, components = criterion(outputs, targets, alpha=scheduler.alpha)
+            batch_size = len(originals)
+            for original, erased_image, mask in zip(originals, erased, masks):
+                # Process full-resolution samples independently. Images in this
+                # dataset have different shapes, so stacking would require either
+                # cropping content or adding large padded regions.
+                view_a, view_b, mask_batch = prepare_pair_batch(
+                    [original],
+                    [erased_image],
+                    [mask],
+                    device=device,
+                )
+                with _autocast_context(device):
+                    outputs = model(view_a, view_b)
+                    targets = build_targets(mask_batch, tap_sizes(outputs))
+                    loss, components = criterion(outputs, targets, alpha=scheduler.alpha)
+                if training:
+                    (loss / batch_size).backward()
+                if heatmap_dir is not None:
+                    dump_heatmaps(heatmap_dir, view_a, mask_batch, outputs)
+                    heatmap_dir = None
+                total_loss += float(loss.detach())
+                total_pairs += 1
+                for name, value in components.items():
+                    component_totals[name] = component_totals.get(name, 0.0) + float(value)
             if training:
-                loss.backward()
                 nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
                 optimizer.step()
-                scheduler.step(view_a.shape[0])
-            if heatmap_dir is not None:
-                dump_heatmaps(heatmap_dir, view_a, mask_batch, outputs)
-                heatmap_dir = None
-            batch_size = view_a.shape[0]
-            total_loss += float(loss.detach()) * batch_size
-            total_pairs += batch_size
-            for name, value in components.items():
-                component_totals[name] = component_totals.get(name, 0.0) + float(value) * batch_size
+                scheduler.step(batch_size)
+            if max_batches is not None and batch_index + 1 >= max_batches:
+                break
     if not total_pairs:
         raise ValueError("loader did not yield any batches")
     return (
@@ -181,8 +185,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--root", required=True, type=Path)
     parser.add_argument("--out", type=Path, default=Path("outputs/training"))
     parser.add_argument("--epochs", type=int, default=1)
-    parser.add_argument("--crop", type=int, default=512)
-    parser.add_argument("--batch", type=int, default=4)
+    parser.add_argument(
+        "--batch",
+        type=int,
+        default=1,
+        help="images per optimizer step; full-resolution images are processed sequentially",
+    )
     parser.add_argument("--output-stride", type=int, choices=(4, 8), default=8)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--validation-fraction", type=float, default=0.15)
@@ -194,13 +202,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default=None)
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--disable-augment", action="store_true")
+    parser.add_argument("--max-train-batches", type=int)
+    parser.add_argument("--max-validation-batches", type=int)
     return parser
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(argv)
-    if args.epochs <= 0 or args.crop <= 0 or args.batch <= 0:
-        raise ValueError("epochs, crop, and batch must be positive")
+    if args.epochs <= 0 or args.batch <= 0:
+        raise ValueError("epochs and batch must be positive")
+    if (
+        args.max_train_batches is not None
+        and args.max_train_batches <= 0
+    ) or (
+        args.max_validation_batches is not None
+        and args.max_validation_batches <= 0
+    ):
+        raise ValueError("maximum batch counts must be positive")
     torch.manual_seed(args.seed)
     random.seed(args.seed)
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
@@ -267,11 +285,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 criterion=criterion,
                 optimizer=optimizer,
                 scheduler=scheduler,
-                crop_size=args.crop,
-                rng=random.Random(args.seed + epoch),
                 device=device,
                 max_grad_norm=args.max_grad_norm,
                 heatmap_dir=heatmap_dir,
+                max_batches=args.max_train_batches,
             )
             validation_loss, validation_components = _run_epoch(
                 validation_loader,
@@ -279,10 +296,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 criterion=criterion,
                 optimizer=None,
                 scheduler=scheduler,
-                crop_size=args.crop,
-                rng=random.Random(args.seed + 10_000 + epoch),
                 device=device,
                 max_grad_norm=args.max_grad_norm,
+                max_batches=args.max_validation_batches,
             )
             scheduler.on_validation(validation_loss)
             mitigated = criterion.mitigate_exploding_taps(
