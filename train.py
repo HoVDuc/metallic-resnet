@@ -206,17 +206,7 @@ def _run_epoch(
                     default=0.0,
                 ) if optimizer is not None else 0.0
                 total_label = str(total_batches) if total_batches is not None else "?"
-                LOGGER.info(
-                    "%s batch=%d/%s samples=%d loss=%.6f alpha=%.4f lr=%.3e time=%.2fs",
-                    phase,
-                    batch_index + 1,
-                    total_label,
-                    total_pairs,
-                    total_loss / max(total_pairs, 1),
-                    scheduler.alpha,
-                    lr,
-                    time.perf_counter() - batch_started,
-                )
+                
             LOGGER.debug(
                 "%s batch=%d components=%s",
                 phase,
