@@ -7,6 +7,7 @@ import json
 import logging
 import multiprocessing as mp
 import random
+import re
 from pathlib import Path
 from typing import Any, Callable, Iterator, List, Mapping, Optional, Sequence, Tuple, Union
 
@@ -24,8 +25,19 @@ LOGGER = logging.getLogger(__name__)
 ImageCollection = Union[List[np.ndarray], np.ndarray]
 PairBatch = Tuple[ImageCollection, ImageCollection, ImageCollection]
 PairTask = Tuple[int, Mapping[str, Any], Sequence[Mapping[str, Any]]]
+PairViewTask = Tuple[
+    int,
+    str,
+    Mapping[str, Any],
+    Mapping[str, Any],
+    Sequence[Mapping[str, Any]],
+    Sequence[Mapping[str, Any]],
+]
 PairedTransform = Callable[[np.ndarray, np.ndarray], Tuple[np.ndarray, np.ndarray]]
 _WORKER_CONTEXT: Optional[Mapping[str, Any]] = None
+_PAIR_NAME_RE = re.compile(
+    r"^(?P<key>pair_[^_]+_(?:forward|swapped)_masked)_image(?P<side>[12])(?:_|\.)"
+)
 
 
 class _PreparedPair:
@@ -61,6 +73,59 @@ class _PreparedPair:
         self.original = original
         self.scale = scale
         self.prepared_mask = prepared_mask
+
+
+class _PreparedPairViews:
+    """Prepared data for one source image pair and its symmetric-difference mask."""
+
+    __slots__ = (
+        "sample_id",
+        "pair_key",
+        "image_info_a",
+        "image_info_b",
+        "selected_a",
+        "selected_b",
+        "source_width",
+        "source_height",
+        "image_a",
+        "image_b",
+        "scale",
+        "prepared_a",
+        "prepared_b",
+        "target_mask",
+    )
+
+    def __init__(
+        self,
+        sample_id: int,
+        pair_key: str,
+        image_info_a: Mapping[str, Any],
+        image_info_b: Mapping[str, Any],
+        selected_a: Sequence[Mapping[str, Any]],
+        selected_b: Sequence[Mapping[str, Any]],
+        source_width: int,
+        source_height: int,
+        image_a: np.ndarray,
+        image_b: np.ndarray,
+        scale: float,
+        prepared_a: PreparedMask,
+        prepared_b: PreparedMask,
+        target_mask: np.ndarray,
+    ) -> None:
+        self.sample_id = sample_id
+        self.pair_key = pair_key
+        self.image_info_a = image_info_a
+        self.image_info_b = image_info_b
+        self.selected_a = selected_a
+        self.selected_b = selected_b
+        self.source_width = source_width
+        self.source_height = source_height
+        self.image_a = image_a
+        self.image_b = image_b
+        self.scale = scale
+        self.prepared_a = prepared_a
+        self.prepared_b = prepared_b
+        self.target_mask = target_mask
 
 
 def resize_to_max_size(image: np.ndarray, max_size: int) -> Tuple[np.ndarray, float]:
@@ -106,6 +171,66 @@ def _build_pair_tasks(
             rng.shuffle(source_order)
         image_info, annotations = eligible[source_order[sample_id % len(source_order)]]
         tasks.append((sample_id, image_info, select_random_annotations(annotations, rng)))
+    return tasks
+
+
+def _find_source_pairs(
+    source: CocoDataset, category_id: int
+) -> List[Tuple[str, Mapping[str, Any], Mapping[str, Any], Sequence[Mapping[str, Any]], Sequence[Mapping[str, Any]]]]:
+    """Find ``...image1``/``...image2`` source pairs by filename convention."""
+
+    groups: dict[str, dict[int, Tuple[Mapping[str, Any], Sequence[Mapping[str, Any]]]]] = {}
+    for image_info in source.images:
+        match = _PAIR_NAME_RE.match(str(image_info.get("file_name", "")))
+        if match is None:
+            continue
+        key = match.group("key")
+        side = int(match.group("side"))
+        annotations = source.annotations_for_image(int(image_info["id"]), category_id)
+        groups.setdefault(key, {})[side] = (image_info, annotations)
+
+    pairs = []
+    for key in sorted(groups):
+        group = groups[key]
+        if 1 not in group or 2 not in group:
+            LOGGER.warning("Ignoring incomplete source pair %s", key)
+            continue
+        image_a, annotations_a = group[1]
+        image_b, annotations_b = group[2]
+        if not annotations_a or not annotations_b:
+            continue
+        pairs.append((key, image_a, image_b, annotations_a, annotations_b))
+    return pairs
+
+
+def _build_pair_view_tasks(
+    eligible: Sequence[
+        Tuple[str, Mapping[str, Any], Mapping[str, Any], Sequence[Mapping[str, Any]], Sequence[Mapping[str, Any]]]
+    ],
+    count: int,
+    rng: random.Random,
+) -> List[PairViewTask]:
+    if not eligible:
+        raise ValueError("No complete image pairs with annotations were found")
+    order = list(range(len(eligible)))
+    rng.shuffle(order)
+    tasks: List[PairViewTask] = []
+    for sample_id in range(count):
+        if sample_id and sample_id % len(order) == 0:
+            rng.shuffle(order)
+        key, image_a, image_b, annotations_a, annotations_b = eligible[
+            order[sample_id % len(order)]
+        ]
+        tasks.append(
+            (
+                sample_id,
+                key,
+                image_a,
+                image_b,
+                select_random_annotations(annotations_a, rng),
+                select_random_annotations(annotations_b, rng),
+            )
+        )
     return tasks
 
 
@@ -155,6 +280,89 @@ def _prepare_pair_task(
     )
 
 
+def _prepare_pair_view_task(
+    task: PairViewTask,
+    *,
+    images_dir: Path,
+    max_size: int,
+    dilate_px: int,
+    close_px: int,
+    feather_px: int,
+    context_margin: float,
+) -> _PreparedPairViews:
+    (
+        sample_id,
+        pair_key,
+        image_info_a,
+        image_info_b,
+        selected_a,
+        selected_b,
+    ) = task
+    source_a = images_dir / str(image_info_a["file_name"])
+    source_b = images_dir / str(image_info_b["file_name"])
+    image_a_raw = cv2.imread(str(source_a), cv2.IMREAD_COLOR)
+    image_b_raw = cv2.imread(str(source_b), cv2.IMREAD_COLOR)
+    if image_a_raw is None:
+        raise FileNotFoundError("Could not read image: {}".format(source_a))
+    if image_b_raw is None:
+        raise FileNotFoundError("Could not read image: {}".format(source_b))
+    if image_a_raw.shape != image_b_raw.shape:
+        raise ValueError(
+            "Source pair {} has different image shapes: {} vs {}".format(
+                pair_key, image_a_raw.shape, image_b_raw.shape
+            )
+        )
+
+    source_height, source_width = image_a_raw.shape[:2]
+    mask_a_raw, _ = rasterize_annotations(source_height, source_width, selected_a)
+    mask_b_raw, _ = rasterize_annotations(source_height, source_width, selected_b)
+    image_a, scale = resize_to_max_size(image_a_raw, max_size)
+    image_b, scale_b = resize_to_max_size(image_b_raw, max_size)
+    if image_a.shape != image_b.shape or scale != scale_b:
+        raise ValueError("Source pair {} did not resize to matching shapes".format(pair_key))
+    if scale == 1.0:
+        mask_a = mask_a_raw
+        mask_b = mask_b_raw
+    else:
+        target_size = (image_a.shape[1], image_a.shape[0])
+        mask_a = cv2.resize(mask_a_raw, target_size, interpolation=cv2.INTER_NEAREST)
+        mask_b = cv2.resize(mask_b_raw, target_size, interpolation=cv2.INTER_NEAREST)
+
+    prepared_a = prepare_mask(
+        mask_a,
+        dilate_px=dilate_px,
+        close_px=close_px,
+        feather_px=feather_px,
+        context_margin=context_margin,
+    )
+    prepared_b = prepare_mask(
+        mask_b,
+        dilate_px=dilate_px,
+        close_px=close_px,
+        feather_px=feather_px,
+        context_margin=context_margin,
+    )
+    # A region selected on both views is considered identical. XOR preserves
+    # only the non-overlapping removal regions and explicitly zeros overlap.
+    target_mask = np.bitwise_xor(prepared_a.mask, prepared_b.mask)
+    return _PreparedPairViews(
+        sample_id=sample_id,
+        pair_key=pair_key,
+        image_info_a=image_info_a,
+        image_info_b=image_info_b,
+        selected_a=selected_a,
+        selected_b=selected_b,
+        source_width=source_width,
+        source_height=source_height,
+        image_a=image_a,
+        image_b=image_b,
+        scale=scale,
+        prepared_a=prepared_a,
+        prepared_b=prepared_b,
+        target_mask=target_mask,
+    )
+
+
 def _finalize_pair_task(
     prepared: _PreparedPair, erased: np.ndarray, out_dir: Path
 ) -> Mapping[str, Any]:
@@ -177,6 +385,118 @@ def _finalize_pair_task(
         "erased_path": str(erased_path.relative_to(out_dir)),
         "removed_mask_path": str(removed_mask_path.relative_to(out_dir)),
     }
+
+
+def _finalize_pair_view_task(
+    prepared: _PreparedPairViews,
+    erased_a: np.ndarray,
+    erased_b: np.ndarray,
+    out_dir: Path,
+) -> Mapping[str, Any]:
+    file_name_a = "{:06d}_a.png".format(prepared.sample_id)
+    file_name_b = "{:06d}_b.png".format(prepared.sample_id)
+    image_a_path = out_dir / "image_a" / file_name_a
+    image_b_path = out_dir / "image_b" / file_name_b
+    removed_mask_path = out_dir / "removed_masks" / "{:06d}.png".format(prepared.sample_id)
+    _write_png(image_a_path, erased_a)
+    _write_png(image_b_path, erased_b)
+    _write_png(removed_mask_path, prepared.target_mask)
+    return {
+        "sample_id": prepared.sample_id,
+        "pair_key": prepared.pair_key,
+        "source_image_ids": [
+            int(prepared.image_info_a["id"]), int(prepared.image_info_b["id"])
+        ],
+        "source_file_names": [
+            str(prepared.image_info_a["file_name"]),
+            str(prepared.image_info_b["file_name"]),
+        ],
+        "source_size": [prepared.source_width, prepared.source_height],
+        "size": [prepared.image_a.shape[1], prepared.image_a.shape[0]],
+        "scale": prepared.scale,
+        "selected_annotation_ids_a": [int(item["id"]) for item in prepared.selected_a],
+        "selected_annotation_ids_b": [int(item["id"]) for item in prepared.selected_b],
+        "overlap_pixels": int(
+            np.count_nonzero(np.bitwise_and(prepared.prepared_a.mask, prepared.prepared_b.mask))
+        ),
+        "image_a_path": str(image_a_path.relative_to(out_dir)),
+        "image_b_path": str(image_b_path.relative_to(out_dir)),
+        # Aliases keep generic pair consumers compatible while the explicit
+        # names above document that both views are source images.
+        "original_path": str(image_a_path.relative_to(out_dir)),
+        "erased_path": str(image_b_path.relative_to(out_dir)),
+        "removed_mask_path": str(removed_mask_path.relative_to(out_dir)),
+    }
+
+
+def _generate_pair_view_task(
+    task: PairViewTask,
+    *,
+    images_dir: Path,
+    out_dir: Path,
+    max_size: int,
+    dilate_px: int,
+    close_px: int,
+    feather_px: int,
+    context_margin: float,
+    inpainter: Inpainter,
+) -> Mapping[str, Any]:
+    prepared = _prepare_pair_view_task(
+        task,
+        images_dir=images_dir,
+        max_size=max_size,
+        dilate_px=dilate_px,
+        close_px=close_px,
+        feather_px=feather_px,
+        context_margin=context_margin,
+    )
+    erased_a = remove_details(prepared.image_a, prepared.prepared_a, inpainter)
+    erased_b = remove_details(prepared.image_b, prepared.prepared_b, inpainter)
+    return _finalize_pair_view_task(prepared, erased_a, erased_b, out_dir)
+
+
+def _generate_pair_views_in_batches(
+    tasks: Sequence[PairViewTask],
+    *,
+    images_dir: Path,
+    out_dir: Path,
+    max_size: int,
+    dilate_px: int,
+    close_px: int,
+    feather_px: int,
+    context_margin: float,
+    inpainter: Inpainter,
+    batch_size: int,
+) -> Iterator[Mapping[str, Any]]:
+    """Prepare source pairs on CPU and batch both views through the inpainter."""
+
+    for start in range(0, len(tasks), batch_size):
+        chunk = tasks[start : start + batch_size]
+        prepared_chunk = [
+            _prepare_pair_view_task(
+                task,
+                images_dir=images_dir,
+                max_size=max_size,
+                dilate_px=dilate_px,
+                close_px=close_px,
+                feather_px=feather_px,
+                context_margin=context_margin,
+            )
+            for task in chunk
+        ]
+        items = []
+        for prepared in prepared_chunk:
+            items.extend(
+                (
+                    (prepared.image_a, prepared.prepared_a),
+                    (prepared.image_b, prepared.prepared_b),
+                )
+            )
+        erased = remove_details_batch(items, inpainter)
+        for index, prepared in enumerate(prepared_chunk):
+            erased_a = erased[index * 2]
+            erased_b = erased[index * 2 + 1]
+            yield _finalize_pair_view_task(prepared, erased_a, erased_b, out_dir)
 
 
 def _generate_pair_task(
@@ -270,6 +590,12 @@ def _generate_pair_in_worker(task: PairTask) -> Mapping[str, Any]:
     return _generate_pair_task(task, **_WORKER_CONTEXT)
 
 
+def _generate_pair_view_in_worker(task: PairViewTask) -> Mapping[str, Any]:
+    if _WORKER_CONTEXT is None:
+        raise RuntimeError("Pair worker was not initialized")
+    return _generate_pair_view_task(task, **_WORKER_CONTEXT)
+
+
 def generate_erased_pairs(
     *,
     coco_path: Path,
@@ -288,6 +614,7 @@ def generate_erased_pairs(
     context_margin: float = 2.0,
     workers: int = 1,
     batch_size: int = 1,
+    pair_mode: str = "auto",
     progress: bool = True,
 ) -> None:
     """Generate lossless original/erased pairs and their removal metadata.
@@ -305,10 +632,14 @@ def generate_erased_pairs(
         raise ValueError("workers must be positive")
     if batch_size <= 0:
         raise ValueError("batch_size must be positive")
+    if pair_mode not in {"auto", "pair", "single"}:
+        raise ValueError("pair_mode must be 'auto', 'pair', or 'single'")
     if workers > 1 and inpainter is not None:
         raise ValueError("Custom inpainter requires workers=1")
     if workers > 1 and batch_size > 1:
         raise ValueError("batch_size > 1 requires workers=1")
+    if workers > 1 and method == "lama":
+        raise ValueError("method='lama' requires workers=1; use --batch-size for GPU batching")
     source = CocoDataset.load(Path(coco_path))
     category_id = source.category_id(category)
     eligible = [
@@ -319,17 +650,28 @@ def generate_erased_pairs(
     if not eligible:
         raise ValueError("No images have annotations for category {!r}".format(category))
 
+    source_pairs = _find_source_pairs(source, category_id)
+    use_pair_mode = pair_mode == "pair" or (pair_mode == "auto" and bool(source_pairs))
+    if pair_mode == "pair" and not source_pairs:
+        raise ValueError("pair_mode='pair' requested, but no complete image pairs were found")
+    if use_pair_mode:
+        LOGGER.info("Using paired source mode with %d complete image pairs", len(source_pairs))
+
     out_dir = Path(out_dir)
     _ensure_empty_output_dir(out_dir)
-    original_dir = out_dir / "original"
-    erased_dir = out_dir / "erased"
+    original_dir = out_dir / ("image_a" if use_pair_mode else "original")
+    erased_dir = out_dir / ("image_b" if use_pair_mode else "erased")
     removed_mask_dir = out_dir / "removed_masks"
     original_dir.mkdir()
     erased_dir.mkdir()
     removed_mask_dir.mkdir()
 
     rng = random.Random(seed)
-    tasks = _build_pair_tasks(eligible, count, rng)
+    tasks = (
+        _build_pair_view_tasks(source_pairs, count, rng)
+        if use_pair_mode
+        else _build_pair_tasks(eligible, count, rng)
+    )
     manifest_path = out_dir / "manifest.jsonl"
     with manifest_path.open("w", encoding="utf-8") as manifest:
         if workers == 1:
@@ -338,9 +680,9 @@ def generate_erased_pairs(
                 if method == "lama"
                 else create_inpainter(method)
             )
-            if batch_size > 1 and hasattr(active_inpainter, "inpaint_many"):
-                records = _generate_pairs_in_batches(
-                    tasks,
+            if use_pair_mode and batch_size > 1 and hasattr(active_inpainter, "inpaint_many"):
+                records = _generate_pair_views_in_batches(
+                    tasks,  # type: ignore[arg-type]
                     images_dir=Path(images_dir),
                     out_dir=out_dir,
                     max_size=max_size,
@@ -350,6 +692,34 @@ def generate_erased_pairs(
                     context_margin=context_margin,
                     inpainter=active_inpainter,
                     batch_size=batch_size,
+                )
+            elif not use_pair_mode and batch_size > 1 and hasattr(active_inpainter, "inpaint_many"):
+                records = _generate_pairs_in_batches(
+                    tasks,  # type: ignore[arg-type]
+                    images_dir=Path(images_dir),
+                    out_dir=out_dir,
+                    max_size=max_size,
+                    dilate_px=dilate_px,
+                    close_px=close_px,
+                    feather_px=feather_px,
+                    context_margin=context_margin,
+                    inpainter=active_inpainter,
+                    batch_size=batch_size,
+                )
+            elif use_pair_mode:
+                records = (
+                    _generate_pair_view_task(
+                        task,  # type: ignore[arg-type]
+                        images_dir=Path(images_dir),
+                        out_dir=out_dir,
+                        max_size=max_size,
+                        dilate_px=dilate_px,
+                        close_px=close_px,
+                        feather_px=feather_px,
+                        context_margin=context_margin,
+                        inpainter=active_inpainter,
+                    )
+                    for task in tasks
                 )
             else:
                 records = (
@@ -389,7 +759,10 @@ def generate_erased_pairs(
                     context_margin,
                 ),
             ) as pool:
-                records = pool.imap(_generate_pair_in_worker, tasks)
+                records = pool.imap(
+                    _generate_pair_view_in_worker if use_pair_mode else _generate_pair_in_worker,
+                    tasks,
+                )
                 for record in tqdm(
                     records,
                     total=count,
@@ -426,11 +799,13 @@ class PrecomputedPairDataset:
 
     def __getitem__(self, index: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         record = self.records[index]
+        image_a_key = "image_a_path" if "image_a_path" in record else "original_path"
+        image_b_key = "image_b_path" if "image_b_path" in record else "erased_path"
         original = cv2.imread(
-            str(self.root_dir / str(record["original_path"])), cv2.IMREAD_COLOR
+            str(self.root_dir / str(record[image_a_key])), cv2.IMREAD_COLOR
         )
         erased = cv2.imread(
-            str(self.root_dir / str(record["erased_path"])), cv2.IMREAD_COLOR
+            str(self.root_dir / str(record[image_b_key])), cv2.IMREAD_COLOR
         )
         if original is None or erased is None:
             raise FileNotFoundError("Could not load precomputed pair at index {}".format(index))
@@ -439,7 +814,16 @@ class PrecomputedPairDataset:
         if self.paired_transform is not None:
             transformed = self.paired_transform(original, erased)
             original, erased = _validate_transformed_pair(transformed)
-        difference_mask = np.any(original != erased, axis=2).astype(np.uint8)
+        stored_mask_path = record.get("removed_mask_path") if "image_a_path" in record else None
+        if stored_mask_path is not None:
+            stored_mask = cv2.imread(
+                str(self.root_dir / str(stored_mask_path)), cv2.IMREAD_GRAYSCALE
+            )
+            if stored_mask is None or stored_mask.shape != original.shape[:2]:
+                raise ValueError("Stored removed mask does not match pair dimensions")
+            difference_mask = (stored_mask > 0).astype(np.uint8)
+        else:
+            difference_mask = np.any(original != erased, axis=2).astype(np.uint8)
         return original, erased, difference_mask
 
 
@@ -523,7 +907,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--coco", required=True, type=Path)
     parser.add_argument("--images-dir", required=True, type=Path)
     parser.add_argument("--out", required=True, type=Path)
-    parser.add_argument("--count", type=int, default=1000)
+    parser.add_argument("--count", type=int, default=10)
     parser.add_argument("--max-size", type=int, default=2048)
     parser.add_argument("--category", default="detail")
     parser.add_argument(
@@ -537,7 +921,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Torch device for --method lama (default: cuda if available, else cpu).",
     )
     parser.add_argument("--seed", type=int, default=None)
-    parser.add_argument("--dilate", type=int, default=15)
+    parser.add_argument("--dilate", type=int, default=8)
     parser.add_argument("--close", type=int, default=2)
     parser.add_argument("--feather", type=int, default=9)
     parser.add_argument("--context-margin", type=float, default=2.0)
@@ -549,6 +933,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Tasks per GPU forward pass for batch-capable inpainters "
             "(currently --method lama). Requires --workers 1."
+        ),
+    )
+    parser.add_argument(
+        "--pair-mode",
+        choices=("auto", "pair", "single"),
+        default="auto",
+        help=(
+            "auto detects pair_*_image1/image2 sources; pair forces the new "
+            "two-view format and single keeps the legacy format"
         ),
     )
     return parser
@@ -573,5 +966,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         context_margin=args.context_margin,
         workers=args.workers,
         batch_size=args.batch_size,
+        pair_mode=args.pair_mode,
     )
     return 0
