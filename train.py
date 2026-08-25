@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import random
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
@@ -29,6 +30,9 @@ from models import (
     tap_sizes,
 )
 from torchvision.models import ResNet101_Weights
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 class IndexDataset:
@@ -130,6 +134,8 @@ def _run_epoch(
     max_grad_norm: float,
     heatmap_dir: Optional[Path] = None,
     max_batches: Optional[int] = None,
+    phase: str = "train",
+    progress: bool = True,
 ) -> Tuple[float, dict[str, float]]:
     training = optimizer is not None
     model.train(training)
@@ -137,8 +143,23 @@ def _run_epoch(
     total_pairs = 0
     component_totals: dict[str, float] = {}
     context = torch.enable_grad() if training else torch.no_grad()
+    try:
+        total_batches = len(loader)
+    except TypeError:
+        total_batches = None
+    if max_batches is not None and total_batches is not None:
+        total_batches = min(total_batches, max_batches)
+    batches = tqdm(
+        enumerate(loader),
+        total=total_batches,
+        desc=phase.capitalize(),
+        unit="batch",
+        dynamic_ncols=True,
+        leave=False,
+        disable=not progress,
+    )
     with context:
-        for batch_index, (originals, erased, masks) in enumerate(loader):
+        for batch_index, (originals, erased, masks) in batches:
             if training:
                 assert optimizer is not None
                 optimizer.zero_grad(set_to_none=True)
@@ -170,8 +191,21 @@ def _run_epoch(
                 nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
                 optimizer.step()
                 scheduler.step(batch_size)
+            if progress:
+                batches.set_postfix(
+                    loss="{:.4f}".format(total_loss / max(total_pairs, 1)),
+                    pairs=total_pairs,
+                )
+            LOGGER.debug(
+                "%s batch=%d loss=%.6f pairs=%d",
+                phase,
+                batch_index + 1,
+                total_loss / max(total_pairs, 1),
+                total_pairs,
+            )
             if max_batches is not None and batch_index + 1 >= max_batches:
                 break
+    batches.close()
     if not total_pairs:
         raise ValueError("loader did not yield any batches")
     return (
@@ -204,7 +238,38 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--disable-augment", action="store_true")
     parser.add_argument("--max-train-batches", type=int)
     parser.add_argument("--max-validation-batches", type=int)
+    parser.add_argument(
+        "--log-level",
+        choices=("DEBUG", "INFO", "WARNING", "ERROR"),
+        default="INFO",
+        help="logging verbosity for the console and training log",
+    )
+    parser.add_argument(
+        "--log-file",
+        type=Path,
+        default=None,
+        help="log file path (default: <out>/training.log)",
+    )
+    parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="disable tqdm progress bars",
+    )
     return parser
+
+
+def _configure_logging(out_dir: Path, level: str, log_file: Optional[Path]) -> Path:
+    """Configure console and file logging and return the selected log path."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = log_file or (out_dir / "training.log")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    logging.basicConfig(
+        level=getattr(logging, level.upper()),
+        format="%(asctime)s | %(levelname)s | %(message)s",
+        handlers=[logging.StreamHandler(), logging.FileHandler(path, encoding="utf-8")],
+        force=True,
+    )
+    return path
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -219,6 +284,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         and args.max_validation_batches <= 0
     ):
         raise ValueError("maximum batch counts must be positive")
+    training_log_path = _configure_logging(args.out, args.log_level, args.log_file)
+    LOGGER.info("Starting training; log_file=%s", training_log_path)
     torch.manual_seed(args.seed)
     random.seed(args.seed)
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
@@ -267,9 +334,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         scheduler.load_state_dict(checkpoint["scheduler"])
         start_epoch = int(checkpoint["epoch"]) + 1
 
-    args.out.mkdir(parents=True, exist_ok=True)
+    LOGGER.info(
+        "device=%s train_samples=%d validation_samples=%d epochs=%d batch=%d",
+        device,
+        len(train_dataset),
+        len(validation_dataset),
+        args.epochs,
+        args.batch,
+    )
     heatmap_dir = args.out / "heatmaps"
-    log_path = args.out / "metrics.jsonl"
+    metrics_path = args.out / "metrics.jsonl"
     split = {
         "train_sample_ids": [raw_dataset.metadata(index)["sample_id"] for index in train_indices],
         "validation_sample_ids": [raw_dataset.metadata(index)["sample_id"] for index in validation_indices],
@@ -277,8 +351,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     with (args.out / "split.json").open("w", encoding="utf-8") as stream:
         json.dump(split, stream, indent=2)
 
-    with log_path.open("a", encoding="utf-8") as log_stream:
+    with metrics_path.open("a", encoding="utf-8") as log_stream:
         for epoch in range(start_epoch, args.epochs):
+            LOGGER.info("Epoch %d/%d started", epoch + 1, args.epochs)
             train_loss, train_components = _run_epoch(
                 train_loader,
                 model=model,
@@ -289,6 +364,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 max_grad_norm=args.max_grad_norm,
                 heatmap_dir=heatmap_dir,
                 max_batches=args.max_train_batches,
+                phase="train",
+                progress=not args.no_progress,
             )
             validation_loss, validation_components = _run_epoch(
                 validation_loader,
@@ -299,6 +376,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 device=device,
                 max_grad_norm=args.max_grad_norm,
                 max_batches=args.max_validation_batches,
+                phase="validation",
+                progress=not args.no_progress,
             )
             scheduler.on_validation(validation_loss)
             mitigated = criterion.mitigate_exploding_taps(
@@ -332,6 +411,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "args": vars(args),
             }
             torch.save(checkpoint, args.out / "latest.pt")
+            LOGGER.info(
+                "Epoch %d/%d complete: train_loss=%.6f validation_loss=%.6f alpha=%.4f",
+                epoch + 1,
+                args.epochs,
+                train_loss,
+                validation_loss,
+                scheduler.alpha,
+            )
             print(json.dumps(metrics))
     return 0
 
