@@ -216,7 +216,12 @@ def _run_epoch(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train the detail-removal difference model.")
-    parser.add_argument("--root", required=True, type=Path)
+    parser.add_argument(
+        "--root",
+        required=True,
+        type=Path,
+        help="dataset root containing manifest.jsonl (including pairwise outputs)",
+    )
     parser.add_argument("--out", type=Path, default=Path("outputs/training"))
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument(
@@ -270,6 +275,15 @@ def _configure_logging(out_dir: Path, level: str, log_file: Optional[Path]) -> P
         force=True,
     )
     return path
+
+
+def _load_checkpoint(path: Path, device: torch.device):
+    """Load a training checkpoint across PyTorch versions."""
+    try:
+        return torch.load(str(path), map_location=device, weights_only=False)
+    except TypeError:
+        # ``weights_only`` was added after the versions supported by this repo.
+        return torch.load(str(path), map_location=device)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -327,7 +341,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     scheduler = PosWeightScheduler("linear", alpha_max, hold_pairs, ramp_pairs)
     start_epoch = 0
     if args.resume is not None:
-        checkpoint = torch.load(str(args.resume), map_location=device)
+        checkpoint = _load_checkpoint(args.resume, device)
         model.load_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         criterion.load_state_dict(checkpoint["criterion"])
@@ -344,6 +358,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     heatmap_dir = args.out / "heatmaps"
     metrics_path = args.out / "metrics.jsonl"
+    checkpoints_dir = args.out / "checkpoints"
+    checkpoints_dir.mkdir(parents=True, exist_ok=True)
     split = {
         "train_sample_ids": [raw_dataset.metadata(index)["sample_id"] for index in train_indices],
         "validation_sample_ids": [raw_dataset.metadata(index)["sample_id"] for index in validation_indices],
@@ -398,6 +414,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "train_components": train_components,
                 "validation_components": validation_components,
                 "mitigated_taps": mitigated,
+                "checkpoint": str(Path("checkpoints") / "epoch_{:04d}.pt".format(epoch + 1)),
             }
             log_stream.write(json.dumps(metrics) + "\n")
             log_stream.flush()
@@ -410,14 +427,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "split": split,
                 "args": vars(args),
             }
+            epoch_checkpoint_path = checkpoints_dir / "epoch_{:04d}.pt".format(epoch + 1)
+            torch.save(checkpoint, epoch_checkpoint_path)
             torch.save(checkpoint, args.out / "latest.pt")
             LOGGER.info(
-                "Epoch %d/%d complete: train_loss=%.6f validation_loss=%.6f alpha=%.4f",
+                "Epoch %d/%d complete: train_loss=%.6f validation_loss=%.6f alpha=%.4f checkpoint=%s",
                 epoch + 1,
                 args.epochs,
                 train_loss,
                 validation_loss,
                 scheduler.alpha,
+                epoch_checkpoint_path,
             )
             print(json.dumps(metrics))
     return 0
