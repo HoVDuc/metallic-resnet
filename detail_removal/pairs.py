@@ -811,16 +811,18 @@ class PrecomputedPairDataset:
             raise FileNotFoundError("Could not load precomputed pair at index {}".format(index))
         if original.shape != erased.shape:
             raise ValueError("Original and erased pair dimensions do not match")
-        if self.paired_transform is not None:
-            transformed = self.paired_transform(original, erased)
-            original, erased = _validate_transformed_pair(transformed)
         stored_mask_path = record.get("removed_mask_path") if "image_a_path" in record else None
+        stored_mask = None
         if stored_mask_path is not None:
             stored_mask = cv2.imread(
                 str(self.root_dir / str(stored_mask_path)), cv2.IMREAD_GRAYSCALE
             )
             if stored_mask is None or stored_mask.shape != original.shape[:2]:
-                raise ValueError("Stored removed mask does not match pair dimensions")
+                raise ValueError("Stored removed mask does not match source pair dimensions")
+        if self.paired_transform is not None:
+            transformed = self.paired_transform(original, erased)
+            original, erased = _validate_transformed_pair(transformed)
+        if stored_mask is not None:
             transform_mask = getattr(self.paired_transform, "transform_mask", None)
             if callable(transform_mask):
                 stored_mask = transform_mask(stored_mask)
