@@ -14,7 +14,7 @@ import cv2
 import numpy as np
 
 from .coco import CocoDataset, rasterize_annotations
-from .inpaint.opencv import create_inpainter
+from .inpaint import create_inpainter
 from .mask import ComponentROI, prepare_mask
 from .pipeline import remove_details
 from .qa import QAMetrics, measure_component, summarize_metrics
@@ -33,8 +33,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--category", default="detail")
     parser.add_argument(
         "--method",
-        choices=("fsr-best", "fsr-fast", "telea"),
+        choices=("fsr-best", "fsr-fast", "telea", "lama"),
         default="fsr-best",
+    )
+    parser.add_argument(
+        "--device",
+        default=None,
+        help="Torch device for --method lama (default: cuda if available, else cpu).",
     )
     parser.add_argument("--dilate", type=int, default=15)
     parser.add_argument("--close", type=int, default=2)
@@ -142,7 +147,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     dataset = CocoDataset.load(args.coco)
     category_id = dataset.category_id(args.category)
-    inpainter = create_inpainter(args.method)
+    if args.method == "lama":
+        inpainter = create_inpainter(args.method, device=args.device)
+    else:
+        inpainter = create_inpainter(args.method)
     rng = random.Random(args.seed)
 
     images_output = args.out / "images"

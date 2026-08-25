@@ -11,8 +11,7 @@ import cv2
 import numpy as np
 
 from .coco import CocoDataset, rasterize_annotations
-from .inpaint.base import Inpainter
-from .inpaint.opencv import create_inpainter
+from .inpaint import Inpainter, create_inpainter
 from .mask import prepare_mask
 from .pipeline import remove_details
 from .selection import select_random_annotations

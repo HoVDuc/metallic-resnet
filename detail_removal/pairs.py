@@ -15,10 +15,9 @@ import numpy as np
 from tqdm import tqdm
 
 from .coco import CocoDataset, rasterize_annotations
-from .inpaint.base import Inpainter
-from .inpaint.opencv import create_inpainter
-from .mask import prepare_mask
-from .pipeline import remove_details
+from .inpaint import Inpainter, create_inpainter
+from .mask import PreparedMask, prepare_mask
+from .pipeline import remove_details, remove_details_batch
 from .selection import select_random_annotations
 
 LOGGER = logging.getLogger(__name__)
@@ -27,6 +26,41 @@ PairBatch = Tuple[ImageCollection, ImageCollection, ImageCollection]
 PairTask = Tuple[int, Mapping[str, Any], Sequence[Mapping[str, Any]]]
 PairedTransform = Callable[[np.ndarray, np.ndarray], Tuple[np.ndarray, np.ndarray]]
 _WORKER_CONTEXT: Optional[Mapping[str, Any]] = None
+
+
+class _PreparedPair:
+    """Everything needed to inpaint and write one pair, before inpainting runs."""
+
+    __slots__ = (
+        "sample_id",
+        "image_info",
+        "selected",
+        "source_width",
+        "source_height",
+        "original",
+        "scale",
+        "prepared_mask",
+    )
+
+    def __init__(
+        self,
+        sample_id: int,
+        image_info: Mapping[str, Any],
+        selected: Sequence[Mapping[str, Any]],
+        source_width: int,
+        source_height: int,
+        original: np.ndarray,
+        scale: float,
+        prepared_mask: PreparedMask,
+    ) -> None:
+        self.sample_id = sample_id
+        self.image_info = image_info
+        self.selected = selected
+        self.source_width = source_width
+        self.source_height = source_height
+        self.original = original
+        self.scale = scale
+        self.prepared_mask = prepared_mask
 
 
 def resize_to_max_size(image: np.ndarray, max_size: int) -> Tuple[np.ndarray, float]:
@@ -75,18 +109,16 @@ def _build_pair_tasks(
     return tasks
 
 
-def _generate_pair_task(
+def _prepare_pair_task(
     task: PairTask,
     *,
     images_dir: Path,
-    out_dir: Path,
     max_size: int,
     dilate_px: int,
     close_px: int,
     feather_px: int,
     context_margin: float,
-    inpainter: Inpainter,
-) -> Mapping[str, Any]:
+) -> _PreparedPair:
     sample_id, image_info, selected = task
     source_path = images_dir / str(image_info["file_name"])
     source_image = cv2.imread(str(source_path), cv2.IMREAD_COLOR)
@@ -111,27 +143,102 @@ def _generate_pair_task(
         feather_px=feather_px,
         context_margin=context_margin,
     )
-    erased = remove_details(original, prepared_mask, inpainter)
+    return _PreparedPair(
+        sample_id=sample_id,
+        image_info=image_info,
+        selected=selected,
+        source_width=source_width,
+        source_height=source_height,
+        original=original,
+        scale=scale,
+        prepared_mask=prepared_mask,
+    )
 
-    file_name = "{:06d}.png".format(sample_id)
+
+def _finalize_pair_task(
+    prepared: _PreparedPair, erased: np.ndarray, out_dir: Path
+) -> Mapping[str, Any]:
+    file_name = "{:06d}.png".format(prepared.sample_id)
     original_path = out_dir / "original" / file_name
     erased_path = out_dir / "erased" / file_name
     removed_mask_path = out_dir / "removed_masks" / file_name
-    _write_png(original_path, original)
+    _write_png(original_path, prepared.original)
     _write_png(erased_path, erased)
-    _write_png(removed_mask_path, prepared_mask.mask)
+    _write_png(removed_mask_path, prepared.prepared_mask.mask)
     return {
-        "sample_id": sample_id,
-        "source_image_id": int(image_info["id"]),
-        "source_file_name": str(image_info["file_name"]),
-        "source_size": [source_width, source_height],
-        "size": [original.shape[1], original.shape[0]],
-        "scale": scale,
-        "selected_annotation_ids": [int(annotation["id"]) for annotation in selected],
+        "sample_id": prepared.sample_id,
+        "source_image_id": int(prepared.image_info["id"]),
+        "source_file_name": str(prepared.image_info["file_name"]),
+        "source_size": [prepared.source_width, prepared.source_height],
+        "size": [prepared.original.shape[1], prepared.original.shape[0]],
+        "scale": prepared.scale,
+        "selected_annotation_ids": [int(annotation["id"]) for annotation in prepared.selected],
         "original_path": str(original_path.relative_to(out_dir)),
         "erased_path": str(erased_path.relative_to(out_dir)),
         "removed_mask_path": str(removed_mask_path.relative_to(out_dir)),
     }
+
+
+def _generate_pair_task(
+    task: PairTask,
+    *,
+    images_dir: Path,
+    out_dir: Path,
+    max_size: int,
+    dilate_px: int,
+    close_px: int,
+    feather_px: int,
+    context_margin: float,
+    inpainter: Inpainter,
+) -> Mapping[str, Any]:
+    prepared = _prepare_pair_task(
+        task,
+        images_dir=images_dir,
+        max_size=max_size,
+        dilate_px=dilate_px,
+        close_px=close_px,
+        feather_px=feather_px,
+        context_margin=context_margin,
+    )
+    erased = remove_details(prepared.original, prepared.prepared_mask, inpainter)
+    return _finalize_pair_task(prepared, erased, out_dir)
+
+
+def _generate_pairs_in_batches(
+    tasks: Sequence[PairTask],
+    *,
+    images_dir: Path,
+    out_dir: Path,
+    max_size: int,
+    dilate_px: int,
+    close_px: int,
+    feather_px: int,
+    context_margin: float,
+    inpainter: Inpainter,
+    batch_size: int,
+) -> Iterator[Mapping[str, Any]]:
+    """Prepare masks on CPU, then inpaint each chunk in one GPU batch call."""
+
+    for start in range(0, len(tasks), batch_size):
+        chunk = tasks[start : start + batch_size]
+        prepared_chunk = [
+            _prepare_pair_task(
+                task,
+                images_dir=images_dir,
+                max_size=max_size,
+                dilate_px=dilate_px,
+                close_px=close_px,
+                feather_px=feather_px,
+                context_margin=context_margin,
+            )
+            for task in chunk
+        ]
+        erased_chunk = remove_details_batch(
+            [(prepared.original, prepared.prepared_mask) for prepared in prepared_chunk],
+            inpainter,
+        )
+        for prepared, erased in zip(prepared_chunk, erased_chunk):
+            yield _finalize_pair_task(prepared, erased, out_dir)
 
 
 def _initialize_pair_worker(
@@ -172,6 +279,7 @@ def generate_erased_pairs(
     max_size: int = 2048,
     category: str = "detail",
     method: str = "fsr-best",
+    device: Optional[str] = None,
     inpainter: Optional[Inpainter] = None,
     seed: Optional[int] = None,
     dilate_px: int = 15,
@@ -179,16 +287,28 @@ def generate_erased_pairs(
     feather_px: int = 9,
     context_margin: float = 2.0,
     workers: int = 1,
+    batch_size: int = 1,
     progress: bool = True,
 ) -> None:
-    """Generate lossless original/erased pairs and their removal metadata."""
+    """Generate lossless original/erased pairs and their removal metadata.
+
+    When the resolved inpainter is GPU-batch-capable (currently only
+    ``method="lama"`` / a :class:`~detail_removal.inpaint.lama.LamaInpainter`)
+    and ``batch_size > 1``, masks are still prepared on CPU one task at a
+    time but the inpainting forward pass runs once per ``batch_size`` tasks
+    instead of once per task. This requires ``workers=1``.
+    """
 
     if count <= 0:
         raise ValueError("count must be positive")
     if workers <= 0:
         raise ValueError("workers must be positive")
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
     if workers > 1 and inpainter is not None:
         raise ValueError("Custom inpainter requires workers=1")
+    if workers > 1 and batch_size > 1:
+        raise ValueError("batch_size > 1 requires workers=1")
     source = CocoDataset.load(Path(coco_path))
     category_id = source.category_id(category)
     eligible = [
@@ -213,10 +333,14 @@ def generate_erased_pairs(
     manifest_path = out_dir / "manifest.jsonl"
     with manifest_path.open("w", encoding="utf-8") as manifest:
         if workers == 1:
-            active_inpainter = inpainter or create_inpainter(method)
-            records = (
-                _generate_pair_task(
-                    task,
+            active_inpainter = inpainter or (
+                create_inpainter(method, device=device)
+                if method == "lama"
+                else create_inpainter(method)
+            )
+            if batch_size > 1 and hasattr(active_inpainter, "inpaint_many"):
+                records = _generate_pairs_in_batches(
+                    tasks,
                     images_dir=Path(images_dir),
                     out_dir=out_dir,
                     max_size=max_size,
@@ -225,9 +349,23 @@ def generate_erased_pairs(
                     feather_px=feather_px,
                     context_margin=context_margin,
                     inpainter=active_inpainter,
+                    batch_size=batch_size,
                 )
-                for task in tasks
-            )
+            else:
+                records = (
+                    _generate_pair_task(
+                        task,
+                        images_dir=Path(images_dir),
+                        out_dir=out_dir,
+                        max_size=max_size,
+                        dilate_px=dilate_px,
+                        close_px=close_px,
+                        feather_px=feather_px,
+                        context_margin=context_margin,
+                        inpainter=active_inpainter,
+                    )
+                    for task in tasks
+                )
             for record in tqdm(
                 records,
                 total=count,
@@ -389,7 +527,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-size", type=int, default=2048)
     parser.add_argument("--category", default="detail")
     parser.add_argument(
-        "--method", choices=("fsr-best", "fsr-fast", "telea"), default="fsr-best"
+        "--method",
+        choices=("fsr-best", "fsr-fast", "telea", "lama"),
+        default="fsr-best",
+    )
+    parser.add_argument(
+        "--device",
+        default=None,
+        help="Torch device for --method lama (default: cuda if available, else cpu).",
     )
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--dilate", type=int, default=15)
@@ -397,6 +542,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--feather", type=int, default=9)
     parser.add_argument("--context-margin", type=float, default=2.0)
     parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help=(
+            "Tasks per GPU forward pass for batch-capable inpainters "
+            "(currently --method lama). Requires --workers 1."
+        ),
+    )
     return parser
 
 
@@ -411,11 +565,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         max_size=args.max_size,
         category=args.category,
         method=args.method,
+        device=args.device,
         seed=args.seed,
         dilate_px=args.dilate,
         close_px=args.close,
         feather_px=args.feather,
         context_margin=args.context_margin,
         workers=args.workers,
+        batch_size=args.batch_size,
     )
     return 0
