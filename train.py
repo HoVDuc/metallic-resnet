@@ -6,6 +6,7 @@ import argparse
 import json
 import logging
 import random
+import time
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
 
@@ -19,7 +20,7 @@ from tqdm import tqdm
 from detail_removal import (
     PrecomputedPairDataLoader,
     PrecomputedPairDataset,
-    SynchronizedPhotometricAugment,
+    SynchronizedPhotometricRotate90Augment,
 )
 from losses import MultiLayerDiffLoss, PosWeightScheduler, estimate_alpha_max
 from models import (
@@ -136,6 +137,7 @@ def _run_epoch(
     max_batches: Optional[int] = None,
     phase: str = "train",
     progress: bool = True,
+    log_every: int = 1,
 ) -> Tuple[float, dict[str, float]]:
     training = optimizer is not None
     model.train(training)
@@ -160,6 +162,7 @@ def _run_epoch(
     )
     with context:
         for batch_index, (originals, erased, masks) in batches:
+            batch_started = time.perf_counter()
             if training:
                 assert optimizer is not None
                 optimizer.zero_grad(set_to_none=True)
@@ -195,13 +198,30 @@ def _run_epoch(
                 batches.set_postfix(
                     loss="{:.4f}".format(total_loss / max(total_pairs, 1)),
                     pairs=total_pairs,
+                    alpha="{:.3f}".format(scheduler.alpha),
+                )
+            if (batch_index + 1) % log_every == 0 or batch_index == 0:
+                lr = max(
+                    (float(group["lr"]) for group in optimizer.param_groups),
+                    default=0.0,
+                ) if optimizer is not None else 0.0
+                total_label = str(total_batches) if total_batches is not None else "?"
+                LOGGER.info(
+                    "%s batch=%d/%s samples=%d loss=%.6f alpha=%.4f lr=%.3e time=%.2fs",
+                    phase,
+                    batch_index + 1,
+                    total_label,
+                    total_pairs,
+                    total_loss / max(total_pairs, 1),
+                    scheduler.alpha,
+                    lr,
+                    time.perf_counter() - batch_started,
                 )
             LOGGER.debug(
-                "%s batch=%d loss=%.6f pairs=%d",
+                "%s batch=%d components=%s",
                 phase,
                 batch_index + 1,
-                total_loss / max(total_pairs, 1),
-                total_pairs,
+                {name: round(value / max(total_pairs, 1), 6) for name, value in component_totals.items()},
             )
             if max_batches is not None and batch_index + 1 >= max_batches:
                 break
@@ -241,6 +261,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default=None)
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--disable-augment", action="store_true")
+    parser.add_argument(
+        "--rotate-probability",
+        type=float,
+        default=1.0,
+        help="probability of applying a random 0/90/180/270-degree turn to train pairs",
+    )
     parser.add_argument("--max-train-batches", type=int)
     parser.add_argument("--max-validation-batches", type=int)
     parser.add_argument(
@@ -254,6 +280,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help="log file path (default: <out>/training.log)",
+    )
+    parser.add_argument(
+        "--log-every",
+        type=int,
+        default=1,
+        help="write a batch log every N batches (default: 1)",
     )
     parser.add_argument(
         "--no-progress",
@@ -298,6 +330,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         and args.max_validation_batches <= 0
     ):
         raise ValueError("maximum batch counts must be positive")
+    if args.log_every <= 0:
+        raise ValueError("log-every must be positive")
+    if not 0.0 <= args.rotate_probability <= 1.0:
+        raise ValueError("rotate-probability must be in [0, 1]")
     training_log_path = _configure_logging(args.out, args.log_level, args.log_file)
     LOGGER.info("Starting training; log_file=%s", training_log_path)
     torch.manual_seed(args.seed)
@@ -305,7 +341,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     augment = None
     if not args.disable_augment:
-        augment = SynchronizedPhotometricAugment(seed=args.seed)
+        augment = SynchronizedPhotometricRotate90Augment(
+            seed=args.seed,
+            rotation_probability=args.rotate_probability,
+        )
+    augmentation_config = {
+        "enabled": augment is not None,
+        "type": type(augment).__name__ if augment is not None else None,
+        "synchronized": augment is not None,
+        "seed": args.seed if augment is not None else None,
+        "brightness_probability": getattr(augment, "brightness_probability", None),
+        "brightness_limit": getattr(augment, "brightness_limit", None),
+        "motion_blur_probability": getattr(augment, "motion_blur_probability", None),
+        "motion_blur_kernels": list(getattr(augment, "motion_blur_kernels", ())),
+        "rotation_probability": getattr(augment, "rotation_probability", 0.0),
+        "rotation_choices_degrees": [0, 90, 180, 270] if augment is not None else [],
+    }
+    LOGGER.info(
+        "augmentation train=%s validation=disabled config=%s",
+        type(augment).__name__ if augment is not None else "disabled",
+        augmentation_config,
+    )
     full_train_dataset = PrecomputedPairDataset(args.root, paired_transform=augment)
     raw_dataset = PrecomputedPairDataset(args.root)
     train_indices, validation_indices = split_indices(
@@ -369,6 +425,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     with metrics_path.open("a", encoding="utf-8") as log_stream:
         for epoch in range(start_epoch, args.epochs):
+            epoch_started = time.perf_counter()
             LOGGER.info("Epoch %d/%d started", epoch + 1, args.epochs)
             train_loss, train_components = _run_epoch(
                 train_loader,
@@ -382,6 +439,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 max_batches=args.max_train_batches,
                 phase="train",
                 progress=not args.no_progress,
+                log_every=args.log_every,
             )
             validation_loss, validation_components = _run_epoch(
                 validation_loader,
@@ -394,6 +452,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 max_batches=args.max_validation_batches,
                 phase="validation",
                 progress=not args.no_progress,
+                log_every=args.log_every,
             )
             scheduler.on_validation(validation_loss)
             mitigated = criterion.mitigate_exploding_taps(
@@ -415,6 +474,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "validation_components": validation_components,
                 "mitigated_taps": mitigated,
                 "checkpoint": str(Path("checkpoints") / "epoch_{:04d}.pt".format(epoch + 1)),
+                "augmentation": augmentation_config,
             }
             log_stream.write(json.dumps(metrics) + "\n")
             log_stream.flush()
@@ -431,12 +491,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             torch.save(checkpoint, epoch_checkpoint_path)
             torch.save(checkpoint, args.out / "latest.pt")
             LOGGER.info(
-                "Epoch %d/%d complete: train_loss=%.6f validation_loss=%.6f alpha=%.4f checkpoint=%s",
+                "Epoch %d/%d complete: train_loss=%.6f validation_loss=%.6f alpha=%.4f elapsed=%.2fs checkpoint=%s",
                 epoch + 1,
                 args.epochs,
                 train_loss,
                 validation_loss,
                 scheduler.alpha,
+                time.perf_counter() - epoch_started,
                 epoch_checkpoint_path,
             )
             print(json.dumps(metrics))

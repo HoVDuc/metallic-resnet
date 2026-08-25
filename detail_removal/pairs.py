@@ -821,6 +821,11 @@ class PrecomputedPairDataset:
             )
             if stored_mask is None or stored_mask.shape != original.shape[:2]:
                 raise ValueError("Stored removed mask does not match pair dimensions")
+            transform_mask = getattr(self.paired_transform, "transform_mask", None)
+            if callable(transform_mask):
+                stored_mask = transform_mask(stored_mask)
+                if stored_mask.shape != original.shape[:2]:
+                    raise ValueError("Transformed removed mask does not match pair dimensions")
             difference_mask = (stored_mask > 0).astype(np.uint8)
         else:
             difference_mask = np.any(original != erased, axis=2).astype(np.uint8)

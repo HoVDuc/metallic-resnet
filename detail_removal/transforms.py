@@ -84,6 +84,53 @@ class SynchronizedPhotometricAugment(IndependentPhotometricAugment):
         )
 
 
+class SynchronizedPhotometricRotate90Augment(SynchronizedPhotometricAugment):
+    """Synchronized photometric augmentation plus a random quarter turn.
+
+    The same randomly selected turn (0, 90, 180, or 270 degrees clockwise) is
+    applied to both views.  ``transform_mask`` lets the pair dataset apply the
+    exact same geometric transform to a stored target mask.
+    """
+
+    def __init__(
+        self,
+        *,
+        rotation_probability: float = 1.0,
+        **kwargs: object,
+    ) -> None:
+        if not 0.0 <= rotation_probability <= 1.0:
+            raise ValueError("rotation_probability must be in [0, 1]")
+        super().__init__(**kwargs)
+        self.rotation_probability = rotation_probability
+        self.last_rotation_k = 0
+
+    def __call__(self, original: np.ndarray, erased: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        augmented_original, augmented_erased = super().__call__(original, erased)
+        if self._rng.random() < self.rotation_probability:
+            self.last_rotation_k = self._rng.randrange(4)
+        else:
+            self.last_rotation_k = 0
+        return (
+            _rotate_quarter_turns(augmented_original, self.last_rotation_k),
+            _rotate_quarter_turns(augmented_erased, self.last_rotation_k),
+        )
+
+    def transform_mask(self, mask: np.ndarray) -> np.ndarray:
+        return _rotate_quarter_turns(mask, self.last_rotation_k)
+
+
+def _rotate_quarter_turns(array: np.ndarray, turns_clockwise: int) -> np.ndarray:
+    turns_clockwise %= 4
+    if turns_clockwise == 0:
+        return array.copy()
+    rotation = {
+        1: cv2.ROTATE_90_CLOCKWISE,
+        2: cv2.ROTATE_180,
+        3: cv2.ROTATE_90_COUNTERCLOCKWISE,
+    }[turns_clockwise]
+    return cv2.rotate(array, rotation)
+
+
 def _apply_operations(
     image: np.ndarray,
     brightness_factor: Optional[float],
