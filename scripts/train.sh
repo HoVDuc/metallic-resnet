@@ -2,6 +2,12 @@ python train.py \
   --root data/training-data \
   --out /content/drive/MyDrive/resnet-heatmap-model/ \
   --batch 16 \
+  --crop-size 512 \
+  --workers 4 \
+  --crops-per-sample 1 \
+  --positive-crop-probability 0.7 \
+  --accum-steps 1 \
+  --amp auto \
   --epochs 100 \
   --rotate-probability 1.0 \
   --lr 1e-5
