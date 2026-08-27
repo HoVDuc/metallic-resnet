@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import json
 import logging
+import math
 import random
 import time
 from pathlib import Path
@@ -27,6 +29,7 @@ from detail_removal import (
 from losses import MultiLayerDiffLoss, PosWeightScheduler, estimate_alpha_max
 from models import (
     DifferenceModel,
+    PairAugmentConfig,
     PairCropDataset,
     TruncatedResNet101,
     build_targets,
@@ -66,10 +69,11 @@ def split_indices(size: int, validation_fraction: float, seed: int) -> Tuple[Lis
 
 
 def _stats_signature(
-    *, crop_size: int, seed: int, biased_probability: float, sample_limit: int
+    *, crop_size: int, seed: int, biased_probability: float, sample_limit: int,
+    augmentation_key: str = "none",
 ) -> str:
-    return "crop={}:seed={}:bias={:.6g}:limit={}".format(
-        crop_size, seed, biased_probability, sample_limit
+    return "crop={}:seed={}:bias={:.6g}:limit={}:aug={}".format(
+        crop_size, seed, biased_probability, sample_limit, augmentation_key
     )
 
 
@@ -82,15 +86,22 @@ def _cached_positive_fractions(
     seed: int,
     biased_probability: float,
     refresh: bool,
+    augment_config: Optional[PairAugmentConfig] = None,
+    curriculum_ramp_epochs: int = 0,
     sample_limit: int = 128,
 ) -> List[float]:
     """Estimate positive frequency on the actual crop distribution and cache it."""
 
+    augmentation_json = json.dumps(
+        (augment_config or PairAugmentConfig(enabled=False)).to_dict(), sort_keys=True
+    )
+    augmentation_key = hashlib.sha1(augmentation_json.encode("utf-8")).hexdigest()[:12]
     signature = _stats_signature(
         crop_size=crop_size,
         seed=seed,
         biased_probability=biased_probability,
         sample_limit=sample_limit,
+        augmentation_key=augmentation_key,
     )
     cache_path = root / "positive_fractions.json"
     cache: dict[str, Any] = {"version": 1, "distributions": {}}
@@ -119,7 +130,11 @@ def _cached_positive_fractions(
             crops_per_sample=1,
             biased_probability=biased_probability,
             train=True,
+            augment_config=augment_config,
+            curriculum_ramp_epochs=curriculum_ramp_epochs,
         )
+        if curriculum_ramp_epochs > 1:
+            crops.set_epoch(curriculum_ramp_epochs - 1)
         for logical_index, dataset_index in enumerate(selected):
             _, _, mask = crops[logical_index]
             sample_id = str(dataset.metadata(dataset_index).get("sample_id", dataset_index))
@@ -231,6 +246,77 @@ def dump_heatmaps(
     panel = np.hstack((_denormalize(view_a[0]), target, heatmap))
     if not cv2.imwrite(str(output_dir / "latest.jpg"), panel):
         raise OSError("Could not write heatmap diagnostic")
+
+
+def _probe_prediction(outputs: dict[str, dict[str, torch.Tensor]]) -> Tuple[str, torch.Tensor]:
+    head = outputs["learned"] if "learned" in outputs else next(iter(outputs.values()))
+    tap_name = "f2" if "f2" in head else next(iter(head))
+    return tap_name, head[tap_name]
+
+
+def _exposure_stress(view: torch.Tensor, factor: float = 1.1) -> torch.Tensor:
+    mean = view.new_tensor((0.485, 0.456, 0.406))[None, :, None, None]
+    std = view.new_tensor((0.229, 0.224, 0.225))[None, :, None, None]
+    rgb = (view * std + mean).clamp(0, 1)
+    return ((rgb * factor).clamp(0, 1) - mean) / std
+
+
+def _shift_stress(view: torch.Tensor, pixels: int = 2) -> torch.Tensor:
+    if pixels <= 0:
+        return view
+    padded = F.pad(view, (pixels, 0, pixels, 0), mode="replicate")
+    return padded[:, :, : view.shape[-2], : view.shape[-1]]
+
+
+def _augmentation_probes(
+    loader: Any,
+    *,
+    model: DifferenceModel,
+    device: torch.device,
+    amp_dtype: Optional[torch.dtype],
+    channels_last: bool,
+    max_samples: int = 2,
+) -> dict[str, float]:
+    """Measure robustness to nuisance changes on one deterministic validation batch."""
+
+    try:
+        view_a, view_b, mask_batch = next(iter(loader))
+    except StopIteration:
+        return {}
+    view_a = view_a[:max_samples].to(device, non_blocking=True)
+    view_b = view_b[:max_samples].to(device, non_blocking=True)
+    mask_batch = mask_batch[:max_samples].to(device, non_blocking=True)
+    if channels_last:
+        view_a = view_a.contiguous(memory_format=torch.channels_last)
+        view_b = view_b.contiguous(memory_format=torch.channels_last)
+    was_training = model.training
+    model.eval()
+    with torch.no_grad(), _autocast_context(device, amp_dtype):
+        clean_outputs = model(view_a, view_b)
+        tap_name, clean = _probe_prediction(clean_outputs)
+        _, identical = _probe_prediction(model(view_a, view_a))
+        _, photometric = _probe_prediction(model(view_a, _exposure_stress(view_a)))
+        _, shifted = _probe_prediction(model(view_a, _shift_stress(view_a)))
+        _, swapped = _probe_prediction(model(view_b, view_a))
+        target = build_targets(mask_batch, {tap_name: clean.shape[-2:]})[tap_name]
+        predicted_positive = clean >= 0.5
+        target_positive = target > 0.5
+        intersection = (predicted_positive & target_positive).sum().float()
+        union = (predicted_positive | target_positive).sum().float()
+        positives = target_positive.sum().float()
+        probes = {
+            "identical_fp_mean": float(identical.float().mean()),
+            "identical_fp_max": float(identical.float().max()),
+            "photometric_stress_mean": float(photometric.float().mean()),
+            "photometric_stress_max": float(photometric.float().max()),
+            "shift_stress_mean": float(shifted.float().mean()),
+            "shift_stress_max": float(shifted.float().max()),
+            "swap_consistency_mean_abs": float((clean.float() - swapped.float()).abs().mean()),
+            "clean_recall_05": float(intersection / positives.clamp_min(1.0)),
+            "clean_iou_05": float(intersection / union.clamp_min(1.0)),
+        }
+    model.train(was_training)
+    return probes
 
 
 def _run_epoch(
@@ -464,6 +550,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--crops-per-sample", type=int, default=1)
     parser.add_argument("--positive-crop-probability", type=float, default=0.7)
+    parser.add_argument(
+        "--augmentation-ramp-fraction", type=float, default=0.3,
+        help="fraction of epochs used to ramp independent photometric/shift strength",
+    )
+    parser.add_argument("--scale-jitter-min", type=float, default=0.7)
+    parser.add_argument("--scale-jitter-max", type=float, default=1.4)
+    parser.add_argument("--identity-pair-probability", type=float, default=0.08)
+    parser.add_argument("--cutout-probability", type=float, default=0.15)
+    parser.add_argument("--copy-paste-probability", type=float, default=0.10)
+    parser.add_argument("--shift-probability", type=float, default=0.3)
+    parser.add_argument("--independent-shift-pixels", type=int, default=2)
     parser.add_argument("--accum-steps", type=int, default=1)
     parser.add_argument("--amp", choices=("auto", "fp16", "bf16", "off"), default="auto")
     parser.add_argument("--refresh-stats", action="store_true")
@@ -571,6 +668,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         raise ValueError("crop-size/workers must be nonnegative and accum-steps positive")
     if not 0.0 <= args.positive_crop_probability <= 1.0:
         raise ValueError("positive-crop-probability must be in [0, 1]")
+    probability_args = {
+        "augmentation-ramp-fraction": args.augmentation_ramp_fraction,
+        "identity-pair-probability": args.identity_pair_probability,
+        "cutout-probability": args.cutout_probability,
+        "copy-paste-probability": args.copy_paste_probability,
+        "shift-probability": args.shift_probability,
+    }
+    if any(not 0.0 <= value <= 1.0 for value in probability_args.values()):
+        raise ValueError("augmentation probabilities/fractions must be in [0, 1]")
+    if args.scale_jitter_min <= 0 or args.scale_jitter_max < args.scale_jitter_min:
+        raise ValueError("scale jitter range must be positive and ordered")
+    if args.independent_shift_pixels < 0:
+        raise ValueError("independent-shift-pixels must be nonnegative")
     if (
         args.max_train_batches is not None
         and args.max_train_batches <= 0
@@ -594,30 +704,34 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         torch.backends.cudnn.benchmark = True
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
-    augment = None
-    if not args.disable_augment:
-        augment = SynchronizedPhotometricRotate90Augment(
-            seed=args.seed,
-            rotation_probability=args.rotate_probability,
+    pair_augment_config = PairAugmentConfig(
+        enabled=not args.disable_augment,
+        rotation_probability=args.rotate_probability,
+        scale_min=args.scale_jitter_min,
+        scale_max=args.scale_jitter_max,
+        identity_probability=args.identity_pair_probability,
+        cutout_probability=args.cutout_probability,
+        copy_paste_probability=args.copy_paste_probability,
+        shift_probability=args.shift_probability,
+        max_shift_pixels=args.independent_shift_pixels,
+    )
+    curriculum_ramp_epochs = max(
+        1, int(math.ceil(args.epochs * args.augmentation_ramp_fraction))
+    )
+    augmentation_config = pair_augment_config.to_dict()
+    augmentation_config["curriculum_ramp_epochs"] = curriculum_ramp_epochs
+    legacy_augment = None
+    if args.crop_size == 0 and not args.disable_augment:
+        legacy_augment = SynchronizedPhotometricRotate90Augment(
+            seed=args.seed, rotation_probability=args.rotate_probability
         )
-    augmentation_config = {
-        "enabled": augment is not None,
-        "type": type(augment).__name__ if augment is not None else None,
-        "synchronized": augment is not None,
-        "seed": args.seed if augment is not None else None,
-        "brightness_probability": getattr(augment, "brightness_probability", None),
-        "brightness_limit": getattr(augment, "brightness_limit", None),
-        "motion_blur_probability": getattr(augment, "motion_blur_probability", None),
-        "motion_blur_kernels": list(getattr(augment, "motion_blur_kernels", ())),
-        "rotation_probability": getattr(augment, "rotation_probability", 0.0),
-        "rotation_choices_degrees": [0, 90, 180, 270] if augment is not None else [],
-    }
     LOGGER.info(
         "augmentation train=%s validation=disabled config=%s",
-        type(augment).__name__ if augment is not None else "disabled",
+        "PairAugmentConfig" if pair_augment_config.enabled and args.crop_size > 0
+        else type(legacy_augment).__name__ if legacy_augment is not None else "disabled",
         augmentation_config,
     )
-    full_train_dataset = PrecomputedPairDataset(args.root, paired_transform=augment)
+    full_train_dataset = PrecomputedPairDataset(args.root, paired_transform=legacy_augment)
     raw_dataset = PrecomputedPairDataset(args.root)
     train_indices, validation_indices = split_indices(
         len(raw_dataset), args.validation_fraction, args.seed
@@ -631,6 +745,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             crops_per_sample=args.crops_per_sample,
             biased_probability=args.positive_crop_probability,
             train=True,
+            augment_config=pair_augment_config,
+            curriculum_ramp_epochs=curriculum_ramp_epochs,
         )
         validation_dataset = PairCropDataset(
             raw_dataset,
@@ -640,6 +756,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             crops_per_sample=1,
             biased_probability=0.0,
             train=False,
+            augment_config=PairAugmentConfig(enabled=False),
         )
         train_loader = _crop_loader(
             train_dataset,
@@ -657,6 +774,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             workers=args.workers,
             pin_memory=device.type == "cuda",
         )
+        probe_dataset = PairCropDataset(
+            raw_dataset,
+            validation_indices[: max(5, args.batch)],
+            crop_size=args.crop_size,
+            seed=args.seed + 10_000,
+            crops_per_sample=1,
+            biased_probability=1.0,
+            train=True,
+            augment_config=PairAugmentConfig(enabled=False),
+        )
+        probe_loader = _crop_loader(
+            probe_dataset,
+            batch_size=min(args.batch, len(probe_dataset)),
+            shuffle=False,
+            drop_last=False,
+            workers=0,
+            pin_memory=device.type == "cuda",
+        )
         run_epoch = _run_epoch
     else:
         train_dataset = IndexDataset(full_train_dataset, train_indices)
@@ -667,6 +802,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         validation_loader = PrecomputedPairDataLoader(
             validation_dataset, batch_size=args.batch, shuffle=False, drop_last=False
         )
+        probe_loader = None
         run_epoch = _run_full_resolution_epoch
 
     weights = None if args.no_pretrained or args.weights_path else ResNet101_Weights.IMAGENET1K_V2
@@ -696,6 +832,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         seed=args.seed,
         biased_probability=args.positive_crop_probability if args.crop_size > 0 else 0.0,
         refresh=args.refresh_stats,
+        augment_config=pair_augment_config if args.crop_size > 0 else None,
+        curriculum_ramp_epochs=curriculum_ramp_epochs,
     )
     alpha_max = estimate_alpha_max(positive_fractions)
     hold_pairs = max(args.batch, len(train_dataset) * 2)
@@ -779,6 +917,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 **common_epoch_args,
                 **validation_extra_args,
             )
+            probes = {}
+            if args.crop_size > 0:
+                probes = _augmentation_probes(
+                    probe_loader,
+                    model=model,
+                    device=device,
+                    amp_dtype=amp_dtype,
+                    channels_last=args.channels_last,
+                )
             scheduler.on_validation(validation_loss)
             mitigated = criterion.mitigate_exploding_taps(
                 validation_components,
@@ -803,6 +950,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "train_components": train_components,
                 "validation_components": validation_components,
                 "mitigated_taps": mitigated,
+                "augmentation_probes": probes,
+                "augmentation_strength": (
+                    train_dataset.curriculum_strength if args.crop_size > 0 else 0.0
+                ),
                 "checkpoint": str(Path("checkpoints") / "epoch_{:04d}.pt".format(epoch + 1)),
                 "augmentation": augmentation_config,
             }

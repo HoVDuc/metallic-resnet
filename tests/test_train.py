@@ -94,3 +94,10 @@ def test_train_cli_defaults_to_true_cropped_batches():
     assert args.batch == 8
     assert args.workers == 4
     assert args.amp == "auto"
+    assert args.augmentation_ramp_fraction == 0.3
+    assert args.scale_jitter_min == 0.7
+    assert args.scale_jitter_max == 1.4
+    assert args.identity_pair_probability == 0.08
+    assert args.cutout_probability == 0.15
+    assert args.copy_paste_probability == 0.10
+    assert args.independent_shift_pixels == 2

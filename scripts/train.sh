@@ -6,6 +6,14 @@ python train.py \
   --workers 4 \
   --crops-per-sample 1 \
   --positive-crop-probability 0.7 \
+  --augmentation-ramp-fraction 0.3 \
+  --scale-jitter-min 0.7 \
+  --scale-jitter-max 1.4 \
+  --identity-pair-probability 0.08 \
+  --cutout-probability 0.15 \
+  --copy-paste-probability 0.10 \
+  --shift-probability 0.3 \
+  --independent-shift-pixels 2 \
   --accum-steps 1 \
   --amp auto \
   --epochs 100 \
